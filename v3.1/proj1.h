@@ -14,31 +14,31 @@
 #include "AM.h"
 
 enum {
-  N_NODES = 2,               // the number of nodes in our WSN for project 1
-  MAX_X = 10,
+  N_NODES = 5,               // the number of nodes in our WSN for project 1
+  MAX_X = 100,
   N_SEND_WAIT = 1,         // wait for the send busy to clear 2000 times before giving up
   M = 10,                    // the Q difference threshold
-  DUTY_CYCLE_RANGE = 3000,   // the range of the duty cycle peroids (msecs)  between motes
+  DUTY_CYCLE_RANGE = 5000,   // the range of the duty cycle peroids (msecs)  between motes
   MIN_PERIOD = 3000,         // the minimum duty cycle time period in milliseconds
   DUTY_CYCLE_INT = 4,        // the duty cycle interval, the number of duty cycle periods
                              // in a complete duty cycle interval
   DUTY_CYCLE = 3,            // the duty cycle, each node is ON for this many 
                              // duty cycle periods before being turned OFF for
                              // (DUTY_CYCLE_INT - DUTY_CYCLE) periods.
-  PKT_RATE_RANGE = 100,      // The range of packet generation per period
-  MIN_PKT_RATE = 10,         // The minimum packet generation rate per period
+  PKT_RATE_RANGE = 300,      // The range of packet generation per period
+  MIN_PKT_RATE = 33,         // The minimum packet generation rate per period
   QUERY_INT = 100,           // query time interval, the time between neighboring node
                              // buffer size during the duty cycle
-  Q_THRESHOLD = 10,          // queue threshold number indicating when and how many 
+  //  Q_THRESHOLD = 10,          // queue threshold number indicating when and how many 
                              // packets to transmit to a neighboring node (Nj) such that
                              // |Q(i) - Q(j)| < M for all Pj and M/2 for all P!=j
-  PKT_GEN_INT = 10,          // packet generation interval, the number of duty cycle
+  //  PKT_GEN_INT = 10,          // packet generation interval, the number of duty cycle
                              // intervals during which packets are generated.  The total
                              // amount of time spent generating packets is equal to:
                              // (DUTY_CYCLE_INT * DUTY_CYCLE_PERIOD * PKT_GEN_INT)
-  L_MSG_BUFFSIZE = 1,        // the number of bytes allowed on the message buffer
+  //  L_MSG_BUFFSIZE = 1,        // the number of bytes allowed on the message buffer
   Q_LEN = 156,              // the length of the 
-  AM_PROJ_1 = 0x10,          // unique identifier for AMSend and Receive packet communication
+  AM_PROJ_1 = 0x20,          // unique identifier for AMSend and Receive packet communication
 
   // following are command message types that are sent with all messages back and forth to motes
   // that indicate to the receiving motes what the message is and what the mote should do as
@@ -94,7 +94,6 @@ typedef nx_struct {
 
 
 typedef nx_struct {
-  nx_uint8_t    full;              // TRUE if the Q is full
   nx_uint16_t   size;              // the current size of the Q
   nx_uint16_t   seq[N_NODES];      // current sequency number for each destination node
   nx_uint16_t   load_ts[Q_LEN];    // the time that the msg at index i was loaded into the Q

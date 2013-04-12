@@ -97,6 +97,8 @@ implementation {
   bool        gQpkt_snd_busy = FALSE;
   bool        gRcv_busy = FALSE;
 
+  bool        gNew_period = FALSE;
+
   msg_q_t     gQ;            // the Q which stores all created and received messages.
 
 
@@ -112,11 +114,16 @@ implementation {
 
   void sendFail( lmsg_t *lmsg  ) {
     gState.send_fail_err++;
-    printf( "Type: %-2d TS: %-5d Src: %-1d Dst: %-1d snd fail err %-5d | %-5d\n",
-	    lmsg->type, lmsg->seq, lmsg->src_addr, lmsg->dst_addr, 
-            gState.send_fail_err, gState.send_cnt );
-    printfflush( );
+    //    printf( "error, send failed Type: %-2x Src: %-2d Dst: %-2d - snd fail err %-5d | %-5d\n",
+    //	    lmsg->type, lmsg->src_addr, lmsg->dst_addr, gState.send_fail_err, gState.send_cnt );
+    //    printfflush( );
   }
+
+
+  // Use LEDs to report various status issues.
+  void report_problem() { call Leds.led0Toggle(); }
+
+
 
 
   /*********************** END OF helper functions ***************************/
@@ -136,7 +143,6 @@ implementation {
   void initQ( msg_q_t *q ) {
     int i;
 
-    q->full = FALSE;                    // the Q is not full
     q->size = 0;                        // the Q currently has nothing in it
 
     for (i=0; i<Q_LEN; i++) {
@@ -166,10 +172,6 @@ implementation {
     int  i;
     bool q_loaded = FALSE;
 
-    if (q->full) {
-      return( FALSE );
-    }
-
     for (i=0; i<Q_LEN; i++) {           // Traverse the q looking for an empty node
       
       if (!q->load_ts[i]) {
@@ -177,19 +179,17 @@ implementation {
       }
     }
 
-    if (i == Q_LEN) {                   // have traversed entire Q without finding an empty node, Q is full
-      q->full = TRUE;                   // we shouldn't see this case since q->full should be TRUE already
-    }
-
-    else {                              // have found an empty node.  load Q here.
+    if (i < Q_LEN) {                    // have not traversed entire Q without finding an empty node, Q is full
       q->size++;                        // increment the q size by 1
       q->load_ts[i] = call LclTime.getNow( ); // set the timestamp of when Q was loaded.
       memcpy( (lmsg_t *) &q->pkt[i], m, sizeof( lmsg_t ) );
       q_loaded = TRUE;
-    }
 
-    if (q->size == Q_LEN) {             // check to see if the Q is now full
-      q->full = TRUE;                   // ensure that the flag indicates the Q isn't full
+      #ifdef TRACE_LOAD_Q
+      printf( "LD Q: Idx: %-3d  Type: %-2x  Src: %-2d Dst: %-2d Seq: %-4d\n", i, q->pkt[i].type, 
+              q->pkt[i].src_addr, q->pkt[i].dst_addr, q->pkt[i].seq );
+      printfflush( );
+      #endif
     }
 
     return( q_loaded );                 // return TRUE if Q was loaded, FALSE if Q wasn't loaded
@@ -220,7 +220,6 @@ implementation {
     int  i;
     bool retval = TRUE;
 
-
     for (i=0; i<Q_LEN; i++) {           // Traverse the q looking for an empty node
       
       if (q->load_ts[i]) {              // a packet is loaded here
@@ -237,7 +236,6 @@ implementation {
     }
 
     else {                              // have found an empty node.  load Q here.
-      q->full = FALSE;                  // ensure that the flag indicates the Q isn't full
       q->size--;                        // decrement the Q size
       q->load_ts[i] = 0;                // pulling 
       memcpy( m, (lmsg_t *) &q->pkt[i], sizeof( lmsg_t ) );
@@ -308,20 +306,31 @@ implementation {
         
 	  lmsg = (lmsg_t *) call qPktSnd.getPayload( &gQpkt_msg, sizeof( lmsg_t ) );
 	  memcpy( lmsg, (lmsg_t *) &q->pkt[i], sizeof( lmsg_t ) );
+
+	  if (gNew_period) gNew_period = FALSE;
+
+	  while ((gQpkt_snd_busy) & (!gNew_period)) {
+	    cnt++;
+
+	    if (cnt > 20000) break;
+	  }
 	
 	  if (call qPktSnd.send( lmsg->dst_addr, &gQpkt_msg, sizeof( lmsg_t ) ) == SUCCESS) {
 	    gQpkt_snd_busy = TRUE;
 	    call Leds.led1On( );
 
 	    q->size--;                    // decrement the Q size
-	    q->load_ts[i] = 0;            // pulling 
+	    q->load_ts[i] = 0;            // pulling
 
-	    printf( "SEND: %d to %d\n", gState.id, lmsg->dst_addr );
-	    printfflush( );
+	    //	    printf( "Type: %-2x Src: %-2d Dst: %-2d Seq: %-4d\n",
+	    //                     lmsg->type, lmsg->src_addr, lmsg->dst_addr, lmsg->seq );
+	    //	    printfflush( );
+
 	  }
 
 	   else {
-	    sendFail( lmsg  );
+	     report_problem( );
+	     sendFail( lmsg  );
 	  }
 	}
 
@@ -351,11 +360,6 @@ implementation {
   }
 
   /********************** END OF Process functions ***************************/
-
-
-  
-  // Use LEDs to report various status issues.
-  void report_problem() { call Leds.led0Toggle(); }
 
 
   /*
@@ -459,9 +463,11 @@ implementation {
     call Leds.led2On( );
     memcpy( &rmsg, (lmsg_t *) payload, sizeof( lmsg_t ) );
 
+    #ifdef TRACE_RCV_PKT
     printf( "RCVD: Type: %-2x Src: %-1d Dst: %-1d\n",
 	    rmsg.type, rmsg.src_addr, rmsg.dst_addr );
     printfflush( );
+    #endif
 
     switch (rmsg.type) {               // check the message type
 
@@ -508,6 +514,7 @@ implementation {
     call PktTimer.stop( );
 
     gState.tTimer_cnt++;
+    gNew_period = TRUE;
 
     printf( "ID:%-1d, T @ %7lu, P#:%-1d | %-1d, X:%2d | %-2d, Tcnt:%-4d, Pcnt:%-4d, Qcnt:%-4d\n",
             gState.id, call LclTime.getNow( ), gState.not_duty_cycle, gState.period_count, gState.x_cnt, MAX_X, 
