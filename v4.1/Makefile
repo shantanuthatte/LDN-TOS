@@ -1,0 +1,5 @@
+COMPONENT=proj1AppC
+CFLAGS += -I$(TOSDIR)/lib/printf
+CFLAGS += -DPRINTF_BUFFER_SIZE=512
+
+include $(MAKERULES)
