@@ -1,0 +1,1032 @@
+/*
+ * Authors:        Michael Stewart, Shabana Sangli, Shantanu Thatte
+ * Date:           April 17, 2013
+ * Version:        4.2
+ * 
+ * Description: 
+ *
+ * $CHANGE LOG / NEEDED UPDATES$
+ *----------------------------------------------------------------------------------
+ * 
+ * VERSION 2.2
+ *
+ * MFS 4.6.2013    Need to modify the Q primitive getQ so that the packet isn't fully
+ *                 removed from the Q until the packet was successfully rcvd by the 
+ *                 destination address.
+ *
+ * MFS 4.6.2013    The seeding of the random number generator doesn't appear to work
+ *
+ * MFS 4.6.2013    The functions processQuery_response and processPacket need to be 
+ *                 coded.  Currently these are just stubbed out.
+ *
+ * VERSION 2.3     
+ *
+ * MFS 4.6.2013    loading the Q looks like it is working but this still needs to be 
+ *                 more thoroughly tested as well as the other Q primitives.
+ *
+ * MFS 4.6.2013    We need to measure how much time the Q spends full vs. how much
+ *                 time it spends not full.
+ *              
+ *                 We need to add error count / error printouts  and other trace code
+ *                 to see how well the code is performing.
+ *
+ * MFS 4.7.2013    Coded the sendWait funtion which should be called before every
+ *                 send.  It will wait until the previous send is completed.  
+ *                 We may need to develop a shortcut out of the sendWait if for
+ *                 some reason a send hangs.
+ *
+ *                 NEEDED : We need to implement a radiosleep to put the radio to
+ *                          sleep during its OFF cycle.
+ *
+ * VERSION 2.4
+ *
+ * VERSION 3.0
+ *
+ * MFS 4.11.2013  Version 2.4 became somewhat stable.  Only tested on 2 motes but it runs with
+ *                a hang until testing was stopped.  However, not a lot of packets are getting
+ *                through; like 30 or so before packets quit being generated.
+ *
+ * VERSION 3.1
+ *
+ * VERSION 3.2    4.14.2013 MFS
+ *
+ *
+ *----------------------------------------------------------------------------------
+ */
+
+
+
+#include "printf.h"
+#include "Timer.h"
+#include "proj1.h"
+#include "AM.h"
+
+#define TRACE_RCV_PKT
+//#define TRACE_Q
+//#define EN_PRINTF
+#define TRACE_LOAD_Q
+
+module proj1C {
+  
+  uses {
+    interface Boot;
+    interface SplitControl as RadioControl;
+    interface Packet;
+    interface AMPacket;
+    interface AMSend as qCmdSnd;
+    interface AMSend as qRspSnd;
+    interface AMSend as qPktSnd;
+    interface Receive;
+    interface Timer<TMilli> as LclTime;
+    interface Timer<TMilli> as PeriodTimer;
+    interface Timer<TMilli> as QTimer;
+    interface Timer<TMilli> as PktTimer;
+    interface Timer<TMilli> as SndTimer;
+    interface Timer<TMilli> as ProcTimer;
+    //    interface Read<uint16_t>;
+    interface Leds;
+    interface ActiveMessageAddress;
+    interface ParameterInit<uint16_t> as Seed;
+    interface Random;
+  }
+}
+
+
+implementation {
+  state_t     gState;        // Stores the general state of the mote, counts, timer periods, 
+  message_t   gSndMsg;
+  message_t   gRcvMsg;
+  message_t   gQcmd_msg;
+  message_t   gQrsp_msg;
+  message_t   gQpkt_msg;
+  lmsg_t      rmsg;
+
+  bool        gQcmd_snd_busy = FALSE;
+  bool        gQrsp_snd_busy = FALSE;
+  bool        gQpkt_snd_busy = FALSE;
+  bool        gRcv_busy = FALSE;
+  bool        gSnd_busy = FALSE;
+
+  bool        gNew_period = FALSE;
+
+  msg_q_t     gQ;            // the Q which stores all created and received messages.
+  msg_q_t     rQ;
+
+
+  /*********************** Start OF helper functions *************************/
+
+  
+  /*
+   * Function:     sendFail
+   *
+   * Description:  called if the send should fail
+   *
+   */
+
+  void sendFail( lmsg_t *lmsg  ) {
+    gState.send_fail_err++;
+    //    printf( "error, send failed Type: %-2x Src: %-2d Dst: %-2d - snd fail err %-5d | %-5d\n",
+    //	    lmsg->type, lmsg->src_addr, lmsg->dst_addr, gState.send_fail_err, gState.send_cnt );
+    //    printfflush( );
+  }
+
+
+  // Use LEDs to report various status issues.
+  void report_problem() { 
+    printf("Problem..!!\n");
+    call Leds.led0Toggle(); }
+
+
+
+
+  /*********************** END OF helper functions ***************************/
+    
+
+
+
+  /******************** Start OF Q primitives functions **********************/ 
+
+  /*
+   * Function:     initQ
+   *
+   * Description:  Initialize the Q
+   *
+   */
+
+  void initQ( msg_q_t *q ) {
+    int i;
+
+    q->size = 0;                        // the Q currently has nothing in it
+    q->removed_cnt = 0;
+    q->loaded_cnt = 0;
+    q->headIndex = 0;
+    q->tailIndex = 0;
+
+    for (i=0; i<Q_LEN; i++) {
+      q->load_ts[i] = 0;                // indicates that nothing is loaded at msg buffer location i
+    }
+
+    for (i=0; i<N_NODES; i++) {
+      q->seq[i] = 0;
+      q->dst_cnt[i] = 0;
+    }
+  }
+
+
+  /*
+   * Function:     loadQ
+   *
+   * Description:  Load a message_t structure into the Q into the first location
+   *               available.  Also, set the time at the corresponding index in
+   *               the load_time array.  This indicates not only the time that
+   *               the message was loaded but also that the Q buffer has a 
+   *               message in it at this index.
+   *
+   * Return:       TRUE: Q was loaded with a message
+   *               FALSE: Q Was not loaded with a message
+   */ 
+
+  bool loadQ( msg_q_t *q, lmsg_t *m ) {
+    int  i;
+    bool q_loaded = FALSE;
+
+    if(q->size >= Q_LEN-1){                 // Q is full
+      return( q_loaded );
+    }else{
+      if(q->tailIndex >= Q_LEN-1 ){             //Tail reached end, rearrange Q
+
+        for(i=0; q->headIndex <= q->tailIndex; i++){
+          q->load_ts[i] = q->load_ts[q->headIndex];
+          q->pkt[i] = q->pkt[q->headIndex];
+          q->headIndex++;
+        }
+        q->tailIndex = i;
+        q->headIndex = 0;
+      }
+      memcpy((lmsg_t *)&q->pkt[q->tailIndex], m, sizeof(lmsg_t));
+      q->load_ts[q->tailIndex] = call LclTime.getNow();
+      q->dst_cnt[q->pkt[q->tailIndex].dst_addr-1]++;
+      q->tailIndex++;
+      q->size++;
+      q->loaded_cnt++;
+      q_loaded = TRUE;
+      return(q_loaded);
+    }
+    /*for (i=0; i<Q_LEN; i++) {           // Traverse the q looking for an empty node
+      
+      if (!q->load_ts[i]) {
+	break;                          // We have reached a 0 in the load time array, nothing is loaded here
+      }
+    }
+
+    if (i < Q_LEN) {                    // have not traversed entire Q without finding an empty node, Q is full
+      q->size++;                        // increment the q size by 1
+      q->load_ts[i] = call LclTime.getNow( ); // set the timestamp of when Q was loaded.
+      memcpy( (lmsg_t *) &q->pkt[i], m, sizeof( lmsg_t ) );
+      q->dst_cnt[q->pkt[i].dst_addr-1]++;
+      q->loaded_cnt++;
+      q_loaded = TRUE;
+
+      #ifdef TRACE_LOAD_Q
+      printf( "LD Q: Idx: %-3d  Type: %-2x  Src: %-2d Dst: %-2d Seq: %-4d\n", i, q->pkt[i].type, 
+              q->pkt[i].src_addr, q->pkt[i].dst_addr, q->pkt[i].seq );
+      printfflush( );
+      #endif
+    }
+    
+
+    return( q_loaded );                 // return TRUE if Q was loaded, FALSE if Q wasn't loaded
+    */
+  }
+
+  /*
+   * Function:     getQ
+   *
+   * Description:  Gets one message from the q, without deleting
+   *
+   * Return:       lmsg_t - the packet at the begining
+   */ 
+
+  lmsg_t* getQ(msg_q_t *q){
+    if(q->size > 0){
+      lmsg_t *m;
+      m = &q->pkt[q->headIndex];
+      return(m);
+    }else{
+      return(NULL);
+    }
+  }
+
+  /*
+   * Function:     popQ
+   *
+   * Description:  Removes one message from the q
+   *
+   * Return:       TRUE - if successful, else FALSE
+   */ 
+
+  bool popQ(msg_q_t *q){
+    if(q->size > 0){
+      q->headIndex++;
+      q->size--;
+      q->removed_cnt++;
+      if(q->size == 0){
+        q->headIndex = 0;
+        q->tailIndex = 1;
+      }
+      if(q->headIndex >= q->tailIndex){
+        q->pkt[0] = q->pkt[q->headIndex];
+        q->headIndex = 0;
+        q->tailIndex = 1;
+        //printf("Queue Error\n");
+
+      }
+      return(TRUE);
+    }else{
+      return(FALSE);
+    }
+  }
+
+  /******************** END OF Q primitives functions ************************/ 
+
+
+
+  /********************** Start OF Process functions *************************/
+
+
+  /*
+   * Function :     processQuery_cmd
+   * 
+   * Description :  
+   *
+   */
+
+  void processQuery_cmd( msg_q_t *q, lmsg_t *m ) {
+    lmsg_t  *lmsg;
+    bool sent = FALSE;
+    int i=0;
+    //Check if sender has a link
+    //printf("Source: %d, size1: %d, size2: %d\n", m->src_addr, q->size, rQ.loaded_cnt);
+    if(m->src_addr < N_NODES)
+    if(gState.link[m->src_addr] == 1){
+      //Set sender mote as active
+      gState.active[m->src_addr] = 1;
+      while(!sent && i < 2000){
+        if(!gRcv_busy && !gSnd_busy){
+          gSnd_busy = TRUE;
+          lmsg = (lmsg_t *) call qRspSnd.getPayload( &gQrsp_msg, sizeof( lmsg_t ) );
+
+          lmsg->type = QUERY_Q_RSP;           // set type to the query Q response
+          lmsg->src_addr = gState.id;         // set the source address to this motes ID
+          lmsg->dst_addr = m->src_addr;       // set the destination address to the sender of the command
+          lmsg->seq = q->size;                // put the current size of the Q into the sequency # field
+
+          if (call qRspSnd.send( lmsg->dst_addr, &gQrsp_msg, sizeof( lmsg_t ) ) == SUCCESS) {
+            gQrsp_snd_busy = TRUE;
+            gSnd_busy = TRUE;
+            call Leds.led1On( );
+            sent = TRUE;
+            break;
+          }
+
+          else {
+            sendFail( lmsg );
+            sent = TRUE;
+            break;
+          }
+        }
+        i++;
+      }
+    }
+
+
+  } 
+
+
+  /*
+   * Function :     processQuery_response
+   * 
+   * Description :  
+   */
+
+  void processQuery_response(lmsg_t *cmsg ) {
+    /*int     i = 0;
+    int     n = 0;
+    lmsg_t  *lmsg;
+    int     cnt = 0;
+
+    gState.q_size[rmsg.src_addr-1] = rmsg.seq;
+  
+    if (abs( rmsg.seq - gQ.size ) < M) {
+
+      // if the difference between the Qs is greater than some threshold M
+      // then send all packets destined for that source
+
+      while (i < Q_LEN) {
+      
+	if ((gQ.load_ts[i]) &&
+	    ((gQ.pkt[i].dst_addr == rmsg.src_addr) ||
+	    (n < (M / 2))))  {
+        
+	  lmsg = (lmsg_t *) call qPktSnd.getPayload( &gQpkt_msg, sizeof( lmsg_t ) );
+	  memcpy( lmsg, (lmsg_t *) &gQ.pkt[i], sizeof( lmsg_t ) );
+
+	  if (gQ.pkt[i].dst_addr != rmsg.src_addr) n++;
+
+	  if (gNew_period) gNew_period = FALSE;
+
+	  while ((gQpkt_snd_busy) & (!gNew_period)) {
+	    cnt++;
+
+	    if (cnt > 20000) break;
+	  }
+	
+	  if (call qPktSnd.send( rmsg.src_addr, &gQpkt_msg, sizeof( lmsg_t ) ) == SUCCESS) {
+	    gQpkt_snd_busy = TRUE;
+	    call Leds.led1On( );
+
+	    gQ.dst_cnt[lmsg->dst_addr-1]--;
+	    gQ.size--;                    // decrement the Q size
+	    gQ.removed_cnt++;
+	    gQ.load_ts[i] = 0;            // pulling
+
+	    gState.tx_dst_cnt[lmsg->dst_addr-1]++;
+
+	    
+printf( "SEND: Type:%-2x To:%-2d Src: %-2d Dst: %-2d Seq: %-4d\n",
+        lmsg->type, rmsg.src_addr, lmsg->src_addr, lmsg->dst_addr, lmsg->seq );
+	printfflush( );
+
+	  }
+
+	   else {
+	     report_problem( );
+	     sendFail( lmsg  );
+	  }
+	}
+
+	i++;
+      }
+    }*/
+  }
+
+
+  /*
+   * Function :     processPacket
+   * 
+   * Description :  
+   */
+
+  /*void processPacket( ) {
+
+    gState.rcv_dst_cnt[rmsg.dst_addr-1]++;
+
+    if (rmsg.dst_addr == gState.id) {      // the packet was destined for this mote, process (delete) it
+    }
+
+    else {
+
+      if (!loadQ( &gQ, &rmsg )) {
+	gState.q_full_err++;
+      }
+    }
+  }*/
+
+  /*
+   * Function :     doPacket
+   * 
+   * Description :  Do something about the received packet
+   */
+
+  void doPacket() {
+    lmsg_t *cmsg=getQ(&rQ);          //Current PacketAA
+    if(rQ.size > 0 && cmsg != NULL){
+      
+      switch(cmsg->type){
+        case QUERY_Q_CMD:                   // send a response message to the src addr node
+          gState.q_cmd_rcv_cnt++;
+
+          processQuery_cmd( &gQ, cmsg );
+          if(!popQ( &rQ)){report_problem();}
+          break;
+
+        case QUERY_Q_RSP:                   // process the buffer Q size
+          gState.q_rsp_rcv_cnt++;
+          //processQuery_response(cmsg);
+          if(!popQ( &rQ)){report_problem();}
+          break;
+
+        case PACKET_MSG:
+          gState.pkt_rcv_cnt++;
+
+          #ifdef TRACE_RCV_PKT
+            printf( "RCVD: Type: %-2x Src: %-1d Dst: %-1d Seq: %-4d \n",
+              cmsg->type, cmsg->src_addr, cmsg->dst_addr, cmsg->seq );
+            printfflush( );
+          #endif
+          gState.rcv_dst_cnt[cmsg->dst_addr-1]++;
+          if(cmsg->dst_addr == gState.id){             // Its for us!!
+            if(!popQ( &rQ)){report_problem();}
+            #ifdef EN_PRINTF
+              printf("Received Packet from %d, seq: %d\n", cmsg->src_addr, cmsg->seq);
+              printfflush();
+            #endif
+            break;
+          }else{
+            if(gState.link[cmsg->dst_addr] == 1){     // For a mote connected to us
+              if(gState.active[cmsg->dst_addr] == 1){ // If the mote is active, add it to send Q
+                loadQ(&gQ, cmsg);
+                if(!popQ( &rQ)){report_problem();}
+                break;
+              }else{                                  // Drop as the mote is inactive
+                #ifdef EN_PRINTF
+                  printf("Dropped packet for: %d, seq: %d\n", cmsg->dst_addr, cmsg->seq);
+                  printfflush();
+                #endif
+                if(!popQ( &rQ)){report_problem();}
+                break;
+              }
+            }else{                                    // Not for a mote connected to us
+              loadQ(&gQ, cmsg);
+              if(!popQ( &rQ)){report_problem();}
+              break;
+            }
+          }
+          //processPacket( );       // process the received packet
+          break;
+
+        default:
+          gState.dflt_rcv_cnt++;
+          if(!popQ( &rQ)){report_problem();}
+          break;
+      }
+    }
+  }
+
+  /********************** END OF Process functions ***************************/
+  /*
+   * Function :     init
+   *
+   * Description :  Intialize the mote
+   */
+  void init() {
+   int i;
+
+    gState.id = call ActiveMessageAddress.amAddress( );
+    gState.group = call ActiveMessageAddress.amGroup( );
+
+    initQ( &gQ );
+    initQ( &rQ );
+    // March 31st  MFS  Currently, the random seed doesn't appear to be working
+
+    call Seed.init( gState.id );
+
+    gState.period = (call Random.rand16( ) % DUTY_CYCLE_RANGE) + MIN_PERIOD;
+    gState.query_period = QUERY_INT;
+    gState.not_duty_cycle = (call Random.rand16( ) % DUTY_CYCLE_INT);
+    gState.pkt_rate = (call Random.rand16( ) % PKT_RATE_RANGE) + MIN_PKT_RATE; 
+    gState.period_cnt = 0;
+    gState.x_cnt = 0;
+
+    gState.tTimer_cnt = 0;
+    gState.qTimer_cnt = 0;
+    gState.pktTimer_cnt = 0;
+    gState.lclTimer_cnt = 0;
+    gState.send_cnt = 0;
+    gState.q_cmd_rcv_cnt = 0;
+    gState.q_rsp_rcv_cnt = 0;
+    gState.pkt_rcv_cnt = 0;
+    gState.dflt_rcv_cnt = 0;
+    gState.rcv_cnt = 0;
+
+    for (i=0; i<N_NODES; i++) {
+      gState.rcv_dst_cnt[i] = 0;
+      gState.tx_dst_cnt[i] = 0;
+    }
+
+    gState.send_busy_err = 0;
+    gState.send_fail_err = 0;
+    gState.q_full_err = 0;
+    gState.activeT = FALSE;
+    gState.PActiveT = FALSE;
+    gState.pktDst = 0;
+
+    //Setup valid links
+    switch(gState.id){
+      case 1:
+        //Links of 1
+        gState.link[0] = 0;
+        gState.link[1] = 0;
+        gState.link[2] = 1;
+        gState.link[3] = 1;
+        gState.link[4] = 0;
+        gState.link[5] = 0;
+        break;
+
+      case 2:
+        //Links of 1
+        gState.link[0] = 0;
+        gState.link[1] = 1;
+        gState.link[2] = 0;
+        gState.link[3] = 1;
+        gState.link[4] = 1;
+        gState.link[5] = 0;
+        break;
+
+      case 3:
+        //Links of 1
+        gState.link[0] = 0;
+        gState.link[1] = 1;
+        gState.link[2] = 1;
+        gState.link[3] = 0;
+        gState.link[4] = 0;
+        gState.link[5] = 1;
+        break;
+
+      case 4:
+        //Links of 1
+        gState.link[0] = 0;
+        gState.link[1] = 0;
+        gState.link[2] = 1;
+        gState.link[3] = 0;
+        gState.link[4] = 0;
+        gState.link[5] = 1;
+        break;
+
+      case 5:
+        //Links of 1
+        gState.link[0] = 0;
+        gState.link[1] = 0;
+        gState.link[2] = 0;
+        gState.link[3] = 1;
+        gState.link[4] = 1;
+        gState.link[5] = 0;
+        break;
+
+      default:
+        report_problem();
+        break;
+    }
+    //Set all nodes as inactive
+    gState.active[0] = 0;
+    gState.active[1] = 0;
+    gState.active[2] = 0;
+    gState.active[3] = 0;
+    gState.active[4] = 0;
+    gState.active[5] = 0;
+
+    call LclTime.startPeriodic( LCL_TIMER_PERIOD );
+
+#ifdef EN_PRINTF
+    printf( "Node %d has booted. Period: %d. ON period: %d Period Cnt: %d Pkt Rate: %d\n", 
+             gState.id, gState.period, gState.not_duty_cycle, gState.period_cnt, gState.pkt_rate );
+    printfflush( );
+#endif
+  }
+
+  /*
+   * Function :     Boot.booted
+   *
+   * Description :  
+   */
+
+  event void Boot.booted() {
+    init();
+    if (call RadioControl.start() != SUCCESS) {
+      report_problem();
+    }
+  }
+
+
+  /*
+   * Function :     RadioControl.startDone
+   *
+   * Description :  
+   */
+  
+  event void RadioControl.startDone( error_t error ) {
+
+    if (error == SUCCESS) {
+      #ifdef EN_PRINTF
+      printf( "Node %d Radio started. Starting period timer with period of %d\n", gState.id, gState.period );
+      printfflush();
+      #endif
+      call PeriodTimer.startPeriodic( gState.period );
+    }
+  }
+
+  
+
+  /*
+   * Function :     RadioControl.stopDone
+   *
+   * Description :  
+   */
+  
+  event void RadioControl.stopDone( error_t error ) {
+  }
+
+
+
+  /*
+   * Function :     Receive.receive
+   *
+   * Description :  
+   */
+
+  event message_t* Receive.receive(message_t *msg, void *payload, uint8_t len) {
+    lmsg_t *lmsg = (lmsg_t *) payload; 
+    //    lmsg_t *lmsg = (lmsg_t *) call Packet.getPayload;
+    gRcv_busy = TRUE;
+    call Leds.led2On( );
+    gState.rcv_cnt++;
+
+    if (len != sizeof( lmsg_t )) {
+      report_problem( );
+      return msg;
+    }
+
+    gState.rx_bytes += sizeof( message_t ) + len;
+    memcpy( &rmsg, (lmsg_t *) payload, sizeof( lmsg_t ) );
+    //call Packet.clear( msg );
+    #ifdef EN_PRINTF
+      printf("Pckt Type: %d\n", rmsg.type);
+      printfflush();
+    #endif
+
+    if(!loadQ(&rQ, &rmsg)){report_problem();}
+    gRcv_busy = FALSE;
+    call Leds.led2Off( );
+
+    /*switch (rmsg.type) {               // check the message type
+
+    
+    }
+
+    gRcv_busy = FALSE;    
+    call Leds.led2Off( );
+    */
+    return( msg );
+  }
+
+  
+  /*
+   * Function :    SndTimer.fired
+   * 
+   * Description:  The SndTimer sends packets in Q
+   *
+   *
+   */
+
+  event void SndTimer.fired(){
+    if(gQ.size>0){
+      popQ(&gQ);
+    }
+  }
+
+  /*
+   * Function :    ProcTimer.fired
+   * 
+   * Description:  The ProcTimer processes packets in Q
+   *
+   *
+   */
+
+  event void ProcTimer.fired(){
+    if(rQ.size > 0){
+      doPacket();
+    }
+  }
+
+  /*
+   * Function :    PeriodTimer.fired
+   * 
+   * Description:  The period timer goes off every time T.  There are 4 intervals of time T in
+   *               a complete period, 3 of which the mote is capable of transmitting and 
+   *               receiving.  The fourth, the mote is sleeping.  The sleep interval can
+   *               be either interval, 1, 2, 3, or 4 and randomly rotates each complete
+   *               period. When the mote is on, the query timer is ON and the packet timer
+   *               is ON.
+   */
+
+  event void PeriodTimer.fired( ) { 
+    //call QTimer.stop( );                // ensure that both timers are stopped at start of each interval
+    //call PktTimer.stop( );
+
+    gState.tTimer_cnt++;
+    gNew_period = TRUE;
+
+    if(gState.period_cnt == gState.not_duty_cycle)        //Check if in OFF State
+    {
+      //Sleep State
+      #ifdef EN_PRINTF
+        printf("We are off\n");
+        printfflush();
+      #endif
+
+      gState.PActiveT = gState.activeT;
+      gState.activeT = FALSE;
+      call QTimer.stop();
+      call PktTimer.stop();
+      call SndTimer.stop();
+      call ProcTimer.stop();
+    } else {                                              //We are in ON State
+      gState.PActiveT = gState.activeT;
+      gState.activeT = TRUE;
+      #ifdef EN_PRINTF
+        printf("We are on\n");
+        printfflush();
+      #endif
+      
+      if(!gState.PActiveT) {                              //If previous state was OFF start Timers
+        call QTimer.startPeriodic( gState.query_period );
+        call SndTimer.startPeriodic(SND_INT);
+        call ProcTimer.startPeriodic(PROC_INT);
+        if(gState.pkt_rate > 0){                          //Check if we should generate packets
+          call PktTimer.startPeriodic( gState.pkt_rate );
+        }
+      }
+    }
+
+    /*if (gState.period_cnt != gState.not_duty_cycle) {
+
+      // This is one of the ON intervals, start the query and packet timers
+
+      if (gState.query_period) call QTimer.startPeriodic( gState.query_period );
+      if (gState.pkt_rate) call PktTimer.startPeriodic( gState.pkt_rate );
+    }*/
+
+    gState.period_cnt++;
+
+    if (gState.period_cnt >= DUTY_CYCLE_INT) {
+      gState.not_duty_cycle = (call Random.rand16( ) % DUTY_CYCLE_INT);
+      gState.period_cnt = 0;
+      gState.x_cnt++;
+
+      if (gState.x_cnt >= MAX_X) {                        //Stop sending data after MAX_X
+	       gState.pkt_rate = 0;
+      }
+    }
+  }
+  
+
+  /*
+   * Function :     QTimer.fired
+   *
+   * Description :  Send the Qcmd
+   */
+  
+  event void QTimer.fired( ) {
+    lmsg_t *lmsg;
+    bool sent = FALSE;
+    int i=0;
+    gState.qTimer_cnt++;
+    //call Leds.led1Off( );
+    while(!sent  && i < 2000){
+      if(!gRcv_busy && !gSnd_busy){      // Check if mote is not busy
+        gSnd_busy = TRUE;
+
+        lmsg = (lmsg_t *) call qCmdSnd.getPayload( &gQcmd_msg, sizeof( lmsg_t ) );
+
+        lmsg->type = QUERY_Q_CMD;           // set type to the query Q command
+        lmsg->src_addr = gState.id;         // set the source address to this motes ID
+        lmsg->dst_addr = 0;                 // 0 should be reserved for BROADCAST ADDRESS
+ 
+        if (call qCmdSnd.send( AM_BROADCAST_ADDR, &gQcmd_msg, sizeof( lmsg_t ) ) == SUCCESS) {
+          gQcmd_snd_busy = TRUE;
+          call Leds.led0On( );
+          sent = TRUE;
+          break;
+        }
+        else {
+          sendFail( lmsg );
+          sent = TRUE;
+          break;
+        }
+      }
+    }
+    i++;
+  }
+
+
+  /*
+   * Function :    PktTimer.fired
+   *
+   * Description : Generates packet at node
+   */
+
+  event void PktTimer.fired( ) {
+    lmsg_t  msg;
+    uint8_t tmp = gState.id;
+    bool foundValidNode = FALSE;
+
+    msg.type = PACKET_MSG;              // set type to the query Q command
+    msg.src_addr = gState.id;           // set the source address to this motes ID
+
+    while (!foundValidNode) {
+
+      // call until the node id (destination address) is not this node and randomly send it to some other node
+
+      tmp = (call Random.rand16( ) % N_NODES) + 1;      // 0 should be reserved for BROADCAST ADDRESS
+      if(tmp != gState.id){                             // Destination is not source, could check if dest is active
+        foundValidNode = TRUE;
+      }
+    }
+
+    
+    msg.dst_addr = tmp;
+    msg.seq = gQ.seq[tmp-1]++;
+
+    #ifdef EN_PRINTF
+      //printf("Generating Packet for %d, seq: %d, size:%d \n", tmp, msg.seq,gQ.size);
+      printfflush();
+    #endif
+   
+    if (!loadQ( &gQ, &msg )) {
+      #ifdef EN_PRINTF
+        printf("Queue is full: %d \n", gQ.size);
+        printfflush();
+      #endif
+      gState.q_full_err++;
+    }
+      
+    gState.pktTimer_cnt++;
+  }
+
+
+  /*
+   * Function :    LclTimer.fired
+   *
+   * Description :  
+   */
+
+  event void LclTime.fired( ) {
+    int i;
+    #ifdef TRACE_Q
+    gState.lclTimer_cnt++;
+
+    printf( "ID:%-3d |Ti:%4d |To:%4d |Xi:%4d |Xm:%4d |Tp:%4d |Pp:%4d |Qp:%4d |\n", 
+            gState.id, gState.period_cnt, gState.not_duty_cycle, gState.x_cnt, MAX_X,
+            gState.period, gState.pkt_rate, gState.query_period );
+
+    printf( "TmrCnt |Tc:%4d |Pc:%4d |Qc:%4d |\n", gState.tTimer_cnt, gState.pktTimer_cnt, gState.qTimer_cnt );
+
+    printf( "Rx Typ |Rt:%4d |Rx:%4d |Qq:%4d |Qr:%4d |Qp:%4d |Df:%4d |\n", gState.rx_bytes/(LCL_TIMER_PERIOD/1000), 
+            gState.rcv_cnt, gState.q_cmd_rcv_cnt, gState.q_rsp_rcv_cnt, gState.pkt_rcv_cnt, gState.dflt_rcv_cnt );
+
+    gState.rx_bytes = 0;
+
+    printf( "Rx Dst" );
+
+    for (i=0; i<N_NODES; i++) {
+      printf( " |Q%1d:%4d", i+1, gState.rcv_dst_cnt[i] );
+    }
+
+    printf( " |\n" );
+
+    printf( "Tx Dst" );
+
+    for (i=0; i<N_NODES; i++) {
+      printf( " |Q%1d:%4d", i+1, gState.tx_dst_cnt[i] );
+    }
+
+    printf( " |\n" );
+
+    printf( "Q Size" );
+    gState.q_size[gState.id-1] = gQ.size; // load our Q size into the Q size array
+
+    for (i=0; i<N_NODES; i++) {
+      printf( " |Q%1d:%4d", i+1, gState.q_size[i] );
+    }
+
+    printf( " |Ld:%4d |Rm:%4d |\n", gQ.loaded_cnt, gQ.removed_cnt );
+
+    printf( "Q  Dst" );
+      
+    for (i=0; i<N_NODES; i++) {
+      printf( " |Q%1d:%4d", i+1, gQ.dst_cnt[i] );
+    }
+
+    printf( " |\n" );
+
+    printf( "QSeqID" );
+
+    for (i=0; i<N_NODES; i++) {
+      printf( " |Q%1d:%4d", i+1, gQ.seq[i] );
+    }
+
+    printf( " |\n" );
+    printf( "ERRORs |Tx:%4d |\n", gState.send_fail_err );
+    gState.lclTimer_cnt = 0;
+    printfflush( );
+    #endif
+  }
+
+
+  /*
+   * Function :    AMSend.sendDone
+   *
+   * Description :  
+   */
+    
+  event void qCmdSnd.sendDone(message_t* msg, error_t error) {
+    gQcmd_snd_busy = FALSE;           // the mote is no longer send busy, send is completed
+    gSnd_busy = FALSE;
+    if (error == SUCCESS) {
+      //      report_sent();
+      call Leds.led0Off( );
+    }
+
+    else {
+      report_problem();
+      call Leds.led0Off( );
+    }
+  }
+
+
+  /*
+   * Function :    AMSend.sendDone
+   *
+   * Description :  
+   */
+    
+  event void qRspSnd.sendDone(message_t* msg, error_t error) {
+    gQrsp_snd_busy = FALSE;           // the mote is no longer send busy, send is completed
+    gSnd_busy = FALSE;
+    if (error == SUCCESS) {
+      //      report_sent();
+      call Leds.led1Off( );
+    }
+
+    else {
+      report_problem();
+      call Leds.led1Off( );
+    }
+  }
+
+
+  /*
+   * Function :    AMSend.sendDone
+   *
+   * Description :  
+   */
+    
+  event void qPktSnd.sendDone(message_t* msg, error_t error) {
+    gQpkt_snd_busy = FALSE;           // the mote is no longer send busy, send is completed
+    gSnd_busy = FALSE;
+    if (error == SUCCESS) {
+      //      report_sent();
+      call Leds.led1Off( );
+    }
+
+    else {
+      report_problem();
+      call Leds.led1Off( );
+    }
+  }
+
+
+  async event void ActiveMessageAddress.changed( ) {
+  }
+
+}
